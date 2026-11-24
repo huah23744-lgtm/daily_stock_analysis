@@ -1,0 +1,121 @@
+name: WeChat stock news
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch news and send to PushPlus
+        env:
+          STOCK_LIST: ${{ secrets.STOCK_LIST }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from datetime import datetime, timedelta, timezone
+          from email.utils import parsedate_to_datetime
+          from html import escape
+          from urllib.parse import urlencode, urlsplit
+          from urllib.request import Request, urlopen
+          from xml.etree import ElementTree
+
+          queries = {
+              'NVDA': 'Nvidia OR NVDA',
+              'TSLA': 'Tesla OR TSLA',
+              'GOOG': 'Alphabet OR Google OR GOOG',
+              'QQQM': 'QQQM OR "Invesco NASDAQ 100 ETF"',
+              'SPYM': 'SPYM OR SPLG OR "State Street SPDR Portfolio S&P 500 ETF"',
+          }
+          now = datetime.now(timezone.utc)
+          china_time = timezone(timedelta(hours=8))
+          cutoff = now - timedelta(hours=24)
+          tickers = list(dict.fromkeys(
+              ticker.strip().upper() for ticker in os.environ['STOCK_LIST'].split(',')
+              if ticker.strip()
+          ))
+          token = os.environ['PUSHPLUS_TOKEN']
+          if not tickers or not token:
+              raise SystemExit('Missing STOCK_LIST or PUSHPLUS_TOKEN')
+          if any(not re.fullmatch(r'[A-Z0-9.\-^=]{1,20}', ticker) for ticker in tickers):
+              raise SystemExit('Invalid symbol in STOCK_LIST')
+
+          sections = [f'<p>{now.astimezone(china_time):%Y-%m-%d %H:%M} 北京时间 · 过去24小时</p>']
+          seen_links = set()
+          seen_titles = set()
+          successful_feeds = 0
+          article_count = 0
+          for ticker in tickers:
+              sections.append(f'<h3>{escape(ticker)}</h3>')
+              query = queries.get(ticker, f'"{ticker}" stock')
+              params = urlencode({'q': f'({query}) when:1d', 'hl': 'en-US',
+                                  'gl': 'US', 'ceid': 'US:en'})
+              request = Request('https://news.google.com/rss/search?' + params,
+                                headers={'User-Agent': 'Mozilla/5.0'})
+              try:
+                  with urlopen(request, timeout=15) as response:
+                      root = ElementTree.fromstring(response.read(2_000_000))
+                  channel = root.find('channel')
+                  if channel is None:
+                      raise ValueError('RSS channel missing')
+              except (OSError, ValueError, ElementTree.ParseError):
+                  sections.append('<p>新闻源暂时不可用。</p>')
+                  continue
+              successful_feeds += 1
+              articles = []
+              for entry in channel.findall('item'):
+                  title = (entry.findtext('title') or '').strip()
+                  source = (entry.findtext('source') or '').strip()
+                  link = (entry.findtext('link') or '').strip()
+                  try:
+                      published = parsedate_to_datetime(entry.findtext('pubDate') or '')
+                  except ValueError:
+                      continue
+                  if (not title or not published.tzinfo or not cutoff <= published <= now
+                          or not link.startswith('https://news.google.com/')):
+                      continue
+                  suffix = ' - ' + source
+                  headline = title.removesuffix(suffix) if source else title
+                  title_key = re.sub(r'\W+', '', headline.casefold())
+                  articles.append((published, headline, title_key, link, source))
+              items = []
+              for published, title, title_key, link, source in sorted(articles, reverse=True):
+                  link_key = urlsplit(link).path
+                  if link_key in seen_links or title_key in seen_titles:
+                      continue
+                  seen_links.add(link_key)
+                  seen_titles.add(title_key)
+                  stamp = published.astimezone(china_time).strftime('%m-%d %H:%M')
+                  items.append(f'<li><a href="{escape(link)}">{escape(title)}</a>'
+                               f'<br>{stamp} · {escape(source or "来源见链接")}</li>')
+                  if len(items) == 4:
+                      break
+              article_count += len(items)
+              sections.append('<ul>' + ''.join(items) + '</ul>' if items
+                              else '<p>暂无新增条目，或已列在其他标的下。</p>')
+
+          if not successful_feeds:
+              raise SystemExit('All news feeds unavailable')
+          payload = json.dumps({'token': token, 'title': '美股自选新闻简报',
+                                'content': ''.join(sections), 'template': 'html',
+                                'channel': 'wechat'}, ensure_ascii=False).encode('utf-8')
+          request = Request('https://www.pushplus.plus/send', data=payload,
+                            headers={'Content-Type': 'application/json; charset=utf-8'})
+          try:
+              with urlopen(request, timeout=25) as response:
+                  result = json.load(response)
+          except (OSError, ValueError):
+              raise SystemExit('PushPlus request failed') from None
+          if result.get('code') != 200:
+              raise SystemExit(f'PushPlus rejected the message (code {result.get("code")!r})')
+          print(f'PushPlus accepted the digest with {article_count} articles from '
+                f'{successful_feeds}/{len(tickers)} feeds.')
+          PY
